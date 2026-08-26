@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.bak
+*.bak[0-9]*
+report.csv
