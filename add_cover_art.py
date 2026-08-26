@@ -36,6 +36,14 @@ from dataclasses import dataclass, field
 from typing import Iterable, Iterator, Optional, Sequence
 
 try:
+    import preview  # 同じフォルダにある preview.py(候補画像の表示)
+except ImportError:  # pragma: no cover - 配置ミスの案内のみ
+    sys.stderr.write(
+        "preview.py が見つかりません。add_cover_art.py と同じフォルダに置いてください。\n"
+    )
+    raise SystemExit(2)
+
+try:
     from mutagen.id3 import APIC, ID3, ID3NoHeaderError
     from mutagen.mp3 import MP3
     from mutagen.mp4 import MP4, MP4Cover
@@ -98,12 +106,15 @@ class Cover:
     source: str = ""
     url: str = ""
     score: float = 1.0
+    label: str = ""  # 画面に出す「アーティスト / アルバム」の表示名
 
 
 @dataclass
 class Result:
     path: str
-    status: str  # embedded / skipped-has-cover / not-found / dry-run / error / no-metadata
+    # embedded / dry-run / skipped-has-cover / skipped-by-user / not-found
+    # / no-metadata / error / quit
+    status: str
     source: str = ""
     query: str = ""
     score: float = 0.0
@@ -117,9 +128,24 @@ class Stats:
     embedded: int = 0
     dry_run: int = 0
     skipped: int = 0
+    user_skipped: int = 0
     not_found: int = 0
     errors: int = 0
     results: list = field(default_factory=list)
+
+    def count(self, result: "Result") -> None:
+        bucket = {
+            "embedded": "embedded",
+            "dry-run": "dry_run",
+            "skipped-has-cover": "skipped",
+            "skipped-by-user": "user_skipped",
+            "error": "errors",
+        }.get(result.status)
+        if bucket is None:
+            if result.status != "quit":
+                self.not_found += 1
+            return
+        setattr(self, bucket, getattr(self, bucket) + 1)
 
 
 # --------------------------------------------------------------------------
@@ -382,40 +408,6 @@ def score_candidate(info: TrackInfo, artist: str, album: str, title: str) -> flo
     return round(0.4 * artist_score + 0.6 * name_score, 3)
 
 
-def search_itunes(info: TrackInfo, size: int, country: str, limiter: RateLimiter) -> Optional[Cover]:
-    """iTunes Search API でアートワークを探す(APIキー不要)."""
-    best: Optional[Cover] = None
-    for entity, term in itunes_queries(info):
-        params = urllib.parse.urlencode(
-            {"term": term, "entity": entity, "limit": 10, "country": country, "media": "music"}
-        )
-        limiter.wait()
-        payload = http_get_json(f"{ITUNES_ENDPOINT}?{params}")
-        if not payload:
-            continue
-        for item in payload.get("results", []):
-            art = item.get("artworkUrl100") or item.get("artworkUrl60")
-            if not art:
-                continue
-            score = score_candidate(
-                info,
-                item.get("artistName", ""),
-                item.get("collectionName", ""),
-                item.get("trackName", ""),
-            )
-            if best is None or score > best.score:
-                best = Cover(
-                    data=b"",
-                    mime="",
-                    source=f"itunes:{entity}",
-                    url=upscale_itunes_url(art, size),
-                    score=score,
-                )
-        if best and best.score >= 0.9:
-            break
-    return best
-
-
 def itunes_queries(info: TrackInfo) -> list:
     """優先度順の (entity, 検索語) を組み立てる."""
     queries = []
@@ -439,41 +431,154 @@ def itunes_queries(info: TrackInfo) -> list:
     return unique
 
 
-def search_musicbrainz(info: TrackInfo, size: int, limiter: RateLimiter) -> Optional[Cover]:
-    """MusicBrainz でリリースを探し、Cover Art Archive の画像URLを返す."""
-    artist, album = info.best_artist, info.album or info.title
-    if not album:
-        return None
-    clauses = [f'release:"{album}"']
-    if artist:
-        clauses.append(f'artist:"{artist}"')
-    params = urllib.parse.urlencode(
-        {"query": " AND ".join(clauses), "fmt": "json", "limit": 5}
-    )
+def dedupe_candidates(candidates: list) -> list:
+    """同じ画像 URL を除き、スコアの高い順に並べ替える."""
+    seen = set()
+    unique = []
+    for candidate in sorted(candidates, key=lambda c: -c.score):
+        if candidate.url in seen:
+            continue
+        seen.add(candidate.url)
+        unique.append(candidate)
+    return unique
+
+
+def itunes_candidates(
+    info: TrackInfo,
+    size: int,
+    country: str,
+    limiter: "RateLimiter",
+    term: Optional[str] = None,
+    stop_at: Optional[float] = None,
+    limit: int = 10,
+) -> list:
+    """iTunes Search API の検索結果を Cover の候補リストにして返す.
+
+    term を渡すと、タグではなくそのキーワードで検索します(手動での再検索用)。
+    stop_at を渡すと、それ以上のスコアの候補が出た時点で打ち切ります(自動処理用)。
+    """
+    queries = [("album", term), ("song", term)] if term else itunes_queries(info)
+    found = []
+    for entity, query in queries:
+        params = urllib.parse.urlencode(
+            {"term": query, "entity": entity, "limit": limit, "country": country, "media": "music"}
+        )
+        limiter.wait()
+        payload = http_get_json(f"{ITUNES_ENDPOINT}?{params}")
+        if not payload:
+            continue
+        for item in payload.get("results", []):
+            art = item.get("artworkUrl100") or item.get("artworkUrl60")
+            if not art:
+                continue
+            artist_name = item.get("artistName", "")
+            collection = item.get("collectionName", "")
+            track_name = item.get("trackName", "")
+            found.append(
+                Cover(
+                    data=b"",
+                    mime="",
+                    source=f"itunes:{entity}",
+                    url=upscale_itunes_url(art, size),
+                    score=score_candidate(info, artist_name, collection, track_name),
+                    label=" / ".join(x for x in (artist_name, collection or track_name) if x),
+                )
+            )
+        if stop_at is not None and found and max(c.score for c in found) >= stop_at:
+            break
+    return dedupe_candidates(found)
+
+
+def musicbrainz_candidates(
+    info: TrackInfo,
+    size: int,
+    limiter: "RateLimiter",
+    term: Optional[str] = None,
+    limit: int = 5,
+) -> list:
+    """MusicBrainz のリリース検索から Cover Art Archive の候補を作る."""
+    if term:
+        query = term
+    else:
+        album = info.album or info.title
+        if not album:
+            return []
+        clauses = [f'release:"{album}"']
+        if info.best_artist:
+            clauses.append(f'artist:"{info.best_artist}"')
+        query = " AND ".join(clauses)
+
+    params = urllib.parse.urlencode({"query": query, "fmt": "json", "limit": limit})
     limiter.wait()
     payload = http_get_json(f"{MUSICBRAINZ_ENDPOINT}?{params}")
     if not payload:
-        return None
+        return []
+
     caa_size = 500 if size <= 500 else 1200
+    found = []
     for release in payload.get("releases", []):
         mbid = release.get("id")
         if not mbid:
             continue
         credits = release.get("artist-credit") or []
         release_artist = credits[0].get("name", "") if credits else ""
-        score = score_candidate(info, release_artist, release.get("title", ""), "")
-        return Cover(
-            data=b"",
-            mime="",
-            source="musicbrainz",
-            url=COVERART_ARCHIVE.format(mbid=mbid, size=caa_size),
-            score=score,
+        title = release.get("title", "")
+        found.append(
+            Cover(
+                data=b"",
+                mime="",
+                source="musicbrainz",
+                url=COVERART_ARCHIVE.format(mbid=mbid, size=caa_size),
+                score=score_candidate(info, release_artist, title, ""),
+                label=" / ".join(x for x in (release_artist, title) if x),
+            )
         )
-    return None
+    return dedupe_candidates(found)
+
+
+def search_itunes(info: TrackInfo, size: int, country: str, limiter: "RateLimiter") -> Optional[Cover]:
+    """自動処理用: iTunes の最有力候補を 1 件返す."""
+    candidates = itunes_candidates(info, size, country, limiter, stop_at=0.9)
+    return candidates[0] if candidates else None
+
+
+def search_musicbrainz(info: TrackInfo, size: int, limiter: "RateLimiter") -> Optional[Cover]:
+    """自動処理用: MusicBrainz の最有力候補を 1 件返す."""
+    candidates = musicbrainz_candidates(info, size, limiter)
+    return candidates[0] if candidates else None
+
+
+def collect_candidates(
+    info: TrackInfo, options: argparse.Namespace, caches: dict, term: Optional[str] = None
+) -> list:
+    """対話モード用: ローカル画像も含めた候補を優先度順に集める."""
+    candidates = []
+    if term is None and not options.no_local:
+        local = find_local_cover(info.path)
+        if local:
+            local.label = f"フォルダ内の画像: {os.path.basename(local.url)}"
+            candidates.append(local)
+    if not options.offline:
+        candidates.extend(
+            itunes_candidates(
+                info, options.size, options.country, caches["itunes_limiter"],
+                term=term, limit=options.candidates,
+            )
+        )
+        candidates.extend(
+            musicbrainz_candidates(
+                info, options.size, caches["mb_limiter"], term=term, limit=options.candidates,
+            )
+        )
+    ranked = dedupe_candidates([c for c in candidates if c.source != "local"])
+    local_first = [c for c in candidates if c.source == "local"]
+    return local_first + ranked
 
 
 def fetch_cover(candidate: Cover) -> Optional[Cover]:
-    """候補 URL から画像を落として検証する."""
+    """候補 URL から画像を落として検証する(ローカル画像は取得済みなのでそのまま)."""
+    if candidate.data:
+        return candidate if sniff_image(candidate.data) else None
     data = http_get(candidate.url, timeout=30.0)
     if not data:
         return None
@@ -541,9 +646,126 @@ def save_folder_jpg(path: str, cover: Cover) -> Optional[str]:
 
 
 # --------------------------------------------------------------------------
+# 対話モード(1 件ずつ画像を見て確定する)
+# --------------------------------------------------------------------------
+HELP_TEXT = """\
+  [Enter] この画像で確定      [n] 次の候補を表示 / 再検索
+  [k]     キーワードを入力    [s] このファイルは飛ばす
+  [v]     OS の画像ビューアで開く(自分で閉じる必要があります)
+  [q]     終了(ここまでの結果は保存されます)"""
+
+
+@dataclass
+class Decision:
+    action: str  # accept / skip / quit
+    cover: Optional[Cover] = None
+
+
+class ConsoleUI:
+    """対話の入出力をまとめたもの(テストではこれを差し替える)."""
+
+    def __init__(self, previewer, ask=input, out=print) -> None:
+        self.previewer = previewer
+        self._ask = ask
+        self.out = out
+
+    def preview(self, cover: Cover, lines: Sequence[str]) -> None:
+        self.previewer.show(cover.data, lines)
+
+    def ask_key(self, prompt: str) -> str:
+        try:
+            return self._ask(prompt).strip().lower()
+        except EOFError:
+            return "q"
+
+    def ask_text(self, prompt: str) -> str:
+        try:
+            return self._ask(prompt).strip()
+        except EOFError:
+            return ""
+
+    def info(self, message: str) -> None:
+        self.out(message)
+
+    def close(self) -> None:
+        self.previewer.close()
+
+
+def describe_candidate(info: TrackInfo, cover: Cover, index: int, total: int) -> list:
+    """プレビューに添える説明文."""
+    size = preview.image_dimensions(cover.data)
+    lines = [
+        f"ファイル : {os.path.basename(info.path)}",
+        f"タグ     : {info.best_artist or '(不明)'} / {info.album or info.title or '(不明)'}",
+        f"候補     : {index + 1}/{total}  {cover.label or '(名称不明)'}",
+        f"取得元   : {cover.source}  一致度 {cover.score}",
+    ]
+    if size:
+        lines.append(f"画像     : {size[0]}x{size[1]} px")
+    return lines
+
+
+def interactive_select(
+    info: TrackInfo, options: argparse.Namespace, caches: dict, ui: ConsoleUI
+) -> Decision:
+    """候補を 1 件ずつ見せて、Enter で確定 / n で次 / k でキーワード再検索."""
+    term: Optional[str] = None
+    candidates = collect_candidates(info, options, caches, term)
+    index = 0
+
+    while True:
+        if index >= len(candidates):
+            if candidates:
+                ui.info("  候補が尽きました。")
+            else:
+                ui.info("  候補が見つかりませんでした。")
+            keyword = ui.ask_text("  検索キーワード(空 Enter でこのファイルは飛ばす)> ")
+            if not keyword:
+                return Decision("skip")
+            term = keyword
+            candidates = collect_candidates(info, options, caches, term)
+            index = 0
+            continue
+
+        candidate = candidates[index]
+        cover = fetch_cover(candidate)
+        if cover is None:
+            index += 1
+            continue
+
+        ui.preview(cover, describe_candidate(info, cover, index, len(candidates)))
+        answer = ui.ask_key("  [Enter]確定 / [n]次 / [k]キーワード / [s]飛ばす / [q]終了 > ")
+
+        if answer == "":
+            return Decision("accept", cover)
+        if answer == "n":
+            index += 1
+            continue
+        if answer == "k":
+            keyword = ui.ask_text("  検索キーワード(空 Enter で候補一覧に戻る)> ")
+            if keyword:
+                term = keyword
+                candidates = collect_candidates(info, options, caches, term)
+                index = 0
+            continue
+        if answer == "s":
+            return Decision("skip")
+        if answer == "q":
+            return Decision("quit")
+        if answer == "v":
+            path = preview.open_in_os_viewer(cover.data, cover.mime)
+            ui.info(f"  ビューアで開きました: {path}" if path else "  ビューアを開けませんでした")
+            continue
+        ui.info(HELP_TEXT)
+
+
+# --------------------------------------------------------------------------
 # 1 ファイルの処理
 # --------------------------------------------------------------------------
-def process_file(path: str, options: argparse.Namespace, caches: dict) -> Result:
+def process_file(
+    path: str, options: argparse.Namespace, caches: dict, ui: Optional[ConsoleUI] = None
+) -> Result:
+    """1 ファイルを処理する。ui を渡すと 1 件ずつ確認する対話モードになる."""
     try:
         if not options.force and has_cover(path):
             return Result(path=path, status="skipped-has-cover")
@@ -556,15 +778,27 @@ def process_file(path: str, options: argparse.Namespace, caches: dict) -> Result
 
     query = f"{info.best_artist} / {info.album or info.title}".strip(" /")
     cover: Optional[Cover] = None
-
-    if not options.no_local:
-        cover = find_local_cover(path)
-
     album_key = info.album_key()
-    if cover is None and album_key and album_key in caches["album"]:
+
+    # 同じアルバムで一度決まった画像は、以降のトラックにそのまま使う
+    # (対話モードで何十回も同じ確認をしないため)
+    if album_key and album_key in caches["album"] and not options.ask_every_file:
         cover = caches["album"][album_key]
 
-    if cover is None and not options.offline:
+    if cover is None and ui is not None:
+        ui.info(f"\n■ {os.path.basename(path)}  [{query or 'タグ情報なし'}]")
+        decision = interactive_select(info, options, caches, ui)
+        if decision.action == "quit":
+            return Result(path=path, status="quit", query=query)
+        if decision.action == "skip":
+            return Result(path=path, status="skipped-by-user", query=query,
+                          message="ユーザーが見送りました")
+        cover = decision.cover
+
+    if cover is None and ui is None and not options.no_local:
+        cover = find_local_cover(path)
+
+    if cover is None and ui is None and not options.offline:
         candidate = search_itunes(info, options.size, options.country, caches["itunes_limiter"])
         if candidate is None or candidate.score < options.min_score:
             fallback = search_musicbrainz(info, options.size, caches["mb_limiter"])
@@ -616,25 +850,39 @@ STATUS_LABEL = {
     "embedded": "付与",
     "dry-run": "付与予定",
     "skipped-has-cover": "既にあり",
+    "skipped-by-user": "見送り",
     "not-found": "見つからず",
     "no-metadata": "情報不足",
     "error": "エラー",
+    "quit": "中断",
 }
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="add_cover_art.py",
-        description="mp3 / m4a にカバーアートが無ければ Web から探して自動で付与します。",
+        description="mp3 / m4a にカバーアートが無ければ Web から探して付与します。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "例:\n"
-            '  python add_cover_art.py "D:/Music" --dry-run    # 変更せず結果だけ確認\n'
-            '  python add_cover_art.py "D:/Music" --backup     # バックアップを取りつつ付与\n'
-            '  python add_cover_art.py "D:/Music" --force      # 既存の画像も上書き\n'
+            '  python add_cover_art.py "D:/Music" --dry-run       # 変更せず結果だけ確認\n'
+            '  python add_cover_art.py "D:/Music" -i              # 画像を見ながら1件ずつ確定\n'
+            '  python add_cover_art.py "D:/Music" -i --preview terminal  # ウィンドウを使わない\n'
+            '  python add_cover_art.py "D:/Music" --backup        # 全自動で付与\n'
         ),
     )
     parser.add_argument("paths", nargs="+", help="対象のフォルダまたはファイル")
+    parser.add_argument("-i", "--interactive", action="store_true",
+                        help="候補画像を見せて Enter で確定、n で次の候補、k でキーワード入力")
+    parser.add_argument("--preview", choices=preview.PREVIEW_MODES, default="auto",
+                        help="対話モードの表示方法: window(1枚のウィンドウを使い回す) / "
+                             "terminal(ウィンドウ無し・端末内に描画) / none(文字のみ) / auto(既定)")
+    parser.add_argument("--preview-width", type=int, default=44,
+                        help="terminal 表示のときの横幅(文字数、既定: 44)")
+    parser.add_argument("--candidates", type=int, default=8,
+                        help="1 回の検索で集める候補数(既定: 8)")
+    parser.add_argument("--ask-every-file", action="store_true",
+                        help="同じアルバムでも 1 ファイルずつ確認する(既定はアルバム単位で 1 回)")
     parser.add_argument("--no-recursive", dest="recursive", action="store_false",
                         help="サブフォルダを辿らない")
     parser.add_argument("--dry-run", action="store_true",
@@ -648,7 +896,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--country", default="JP",
                         help="iTunes ストアの国コード(既定: JP)")
     parser.add_argument("--min-score", type=float, default=0.6,
-                        help="採用する最低一致度 0.0〜1.0(既定: 0.6)。誤爆が多いときは上げる")
+                        help="自動モードで採用する最低一致度 0.0〜1.0(既定: 0.6)")
     parser.add_argument("--no-local", action="store_true",
                         help="フォルダ内の cover.jpg などを使わず、必ず Web から取得する")
     parser.add_argument("--offline", action="store_true",
@@ -675,6 +923,34 @@ def write_report(results: Iterable[Result], destination: str) -> None:
             ])
 
 
+def print_summary(stats: Stats, options: argparse.Namespace) -> None:
+    applied_label = "付与予定" if options.dry_run else "付与"
+    applied_count = stats.dry_run if options.dry_run else stats.embedded
+    print(
+        "\n--- 結果 ---\n"
+        f"{'対象':　<5}: {stats.total} 件\n"
+        f"{applied_label:　<5}: {applied_count} 件\n"
+        f"{'既にあり':　<5}: {stats.skipped} 件\n"
+        f"{'見送り':　<5}: {stats.user_skipped} 件\n"
+        f"{'見つからず':　<5}: {stats.not_found} 件\n"
+        f"{'エラー':　<5}: {stats.errors} 件"
+    )
+
+
+def make_ui(options: argparse.Namespace) -> ConsoleUI:
+    """対話モードの UI を用意する(プレビュー方式は自動フォールバック)."""
+    previewer, note = preview.create_previewer(
+        options.preview, width=options.preview_width
+    )
+    print(f"対話モード: プレビュー = {previewer.name}" + (f" ({note})" if note else ""))
+    if previewer.name == "none" and not preview.pillow_available():
+        print("画像を表示するには Pillow が必要です:  pip install pillow")
+    if previewer.name == "window":
+        print("ウィンドウは 1 枚だけを使い回します。終了時に自動で閉じます。")
+    print(HELP_TEXT)
+    return ConsoleUI(previewer)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     options = build_parser().parse_args(argv)
     for stream in (sys.stdout, sys.stderr):
@@ -683,49 +959,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except (AttributeError, ValueError):
             pass
 
+    if options.interactive and not sys.stdin.isatty():
+        sys.stderr.write("対話モード(-i)はキーボード入力が必要です。端末から実行してください。\n")
+        return 2
+
     caches = {
         "album": {},
         "itunes_limiter": RateLimiter(0.4),
         "mb_limiter": RateLimiter(1.1),  # MusicBrainz は 1 req/sec が上限
     }
     stats = Stats()
+    ui = make_ui(options) if options.interactive else None
 
-    files = iter_audio_files(options.paths, recursive=options.recursive)
     try:
-        for path in files:
+        for path in iter_audio_files(options.paths, recursive=options.recursive):
             if options.limit and stats.total >= options.limit:
                 break
             stats.total += 1
-            result = process_file(path, options, caches)
+            result = process_file(path, options, caches, ui)
             stats.results.append(result)
-            if result.status == "embedded":
-                stats.embedded += 1
-            elif result.status == "dry-run":
-                stats.dry_run += 1
-            elif result.status == "skipped-has-cover":
-                stats.skipped += 1
-            elif result.status == "error":
-                stats.errors += 1
-            else:
-                stats.not_found += 1
+            stats.count(result)
 
+            if result.status == "quit":
+                print("終了します。")
+                break
             if not options.quiet and result.status != "skipped-has-cover":
                 label = STATUS_LABEL.get(result.status, result.status)
                 extra = result.message or f"{result.source} score={result.score}"
                 print(f"[{label}] {os.path.basename(result.path)}  {extra}")
     except KeyboardInterrupt:
         print("\n中断しました。ここまでの結果を表示します。", file=sys.stderr)
+    finally:
+        if ui is not None:
+            ui.close()  # プレビュー用ウィンドウを必ず閉じる
 
-    applied_label = "付与予定" if options.dry_run else "付与"
-    applied_count = stats.dry_run if options.dry_run else stats.embedded
-    print(
-        "\n--- 結果 ---\n"
-        f"{'対象':　<5}: {stats.total} 件\n"
-        f"{applied_label:　<5}: {applied_count} 件\n"
-        f"{'既にあり':　<5}: {stats.skipped} 件\n"
-        f"{'見つからず':　<5}: {stats.not_found} 件\n"
-        f"{'エラー':　<5}: {stats.errors} 件"
-    )
+    print_summary(stats, options)
     if options.report:
         write_report(stats.results, options.report)
         print(f"レポート  : {options.report}")

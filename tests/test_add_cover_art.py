@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import sys
@@ -386,3 +387,273 @@ class CliTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScriptedUI(aca.ConsoleUI):
+    """対話モードのテスト用: 入力を台本どおりに返し、表示内容を記録する."""
+
+    def __init__(self, answers):
+        self.answers = list(answers)
+        self.previews = []
+        self.messages = []
+        self.prompts = []
+        self.closed = False
+
+    def preview(self, cover, lines):
+        self.previews.append((cover, list(lines)))
+
+    def _next(self, prompt):
+        self.prompts.append(prompt)
+        if not self.answers:
+            return "q"
+        return self.answers.pop(0)
+
+    def ask_key(self, prompt):
+        return self._next(prompt)
+
+    def ask_text(self, prompt):
+        return self._next(prompt)
+
+    def info(self, message):
+        self.messages.append(message)
+
+    def close(self):
+        self.closed = True
+
+
+def itunes_result(artist, album, url="https://example.com/source/100x100bb.jpg"):
+    return {"artistName": artist, "collectionName": album, "artworkUrl100": url}
+
+
+class InteractiveTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        self.addCleanup(self.tmp.cleanup)
+        self._orig = (aca.http_get, aca.http_get_json)
+
+        def restore():
+            aca.http_get, aca.http_get_json = self._orig
+
+        self.addCleanup(restore)
+
+    def install(self, network):
+        aca.http_get = network.get
+        aca.http_get_json = network.get_json
+        return network
+
+    def make_mp3(self, name="track.mp3", artist="Daft Punk", album="Discovery"):
+        path = synthetic.write_mp3(os.path.join(self.dir, name))
+        tags = ID3()
+        tags.add(TPE1(encoding=3, text=[artist]))
+        tags.add(TALB(encoding=3, text=[album]))
+        tags.save(path)
+        return path
+
+    def options(self, **kw):
+        kw.setdefault("no_local", True)
+        return default_options(interactive=True, **kw)
+
+    def test_enter_accepts_first_candidate(self):
+        path = self.make_mp3()
+        self.install(FakeNetwork([itunes_result("Daft Punk", "Discovery")]))
+        ui = ScriptedUI([""])
+        result = aca.process_file(path, self.options(), fresh_caches(), ui)
+        self.assertEqual(result.status, "embedded")
+        self.assertTrue(aca.has_cover(path))
+        self.assertEqual(len(ui.previews), 1)
+
+    def test_n_moves_to_next_candidate(self):
+        path = self.make_mp3()
+        self.install(FakeNetwork([
+            itunes_result("Daft Punk", "Discovery", "https://example.com/a/100x100bb.jpg"),
+            itunes_result("Daft Punk", "Discovery (Remastered)", "https://example.com/b/100x100bb.jpg"),
+        ]))
+        ui = ScriptedUI(["n", ""])
+        result = aca.process_file(path, self.options(), fresh_caches(), ui)
+        self.assertEqual(result.status, "embedded")
+        self.assertEqual(len(ui.previews), 2)
+        first, second = ui.previews[0][0].url, ui.previews[1][0].url
+        self.assertNotEqual(first, second)
+        self.assertEqual(result.url, second)
+
+    def test_keyword_research_is_used(self):
+        path = self.make_mp3()
+        net = self.install(FakeNetwork([itunes_result("Daft Punk", "Discovery")]))
+        ui = ScriptedUI(["k", "ダフトパンク ディスカバリー", ""])
+        result = aca.process_file(path, self.options(), fresh_caches(), ui)
+        self.assertEqual(result.status, "embedded")
+        self.assertTrue(
+            any("%E3%83%80%E3%83%95%E3%83%88" in url for url in net.json_calls),
+            "入力したキーワードで再検索されていない",
+        )
+
+    def test_keyword_prompt_when_candidates_run_out(self):
+        path = self.make_mp3()
+        self.install(FakeNetwork([itunes_result("Daft Punk", "Discovery")]))
+        # 1件しかないので n を押すと候補切れ → キーワード入力を促される
+        ui = ScriptedUI(["n", "another keyword", ""])
+        result = aca.process_file(path, self.options(), fresh_caches(), ui)
+        self.assertEqual(result.status, "embedded")
+        self.assertTrue(any("キーワード" in p for p in ui.prompts))
+
+    def test_empty_keyword_skips_file(self):
+        path = self.make_mp3()
+        self.install(FakeNetwork([]))
+        ui = ScriptedUI([""])  # 候補ゼロ → いきなりキーワード入力 → 空でスキップ
+        result = aca.process_file(path, self.options(), fresh_caches(), ui)
+        self.assertEqual(result.status, "skipped-by-user")
+        self.assertFalse(aca.has_cover(path))
+
+    def test_s_skips_and_q_quits(self):
+        path = self.make_mp3()
+        self.install(FakeNetwork([itunes_result("Daft Punk", "Discovery")]))
+        skipped = aca.process_file(path, self.options(), fresh_caches(), ScriptedUI(["s"]))
+        self.assertEqual(skipped.status, "skipped-by-user")
+        quit_result = aca.process_file(path, self.options(), fresh_caches(), ScriptedUI(["q"]))
+        self.assertEqual(quit_result.status, "quit")
+        self.assertFalse(aca.has_cover(path))
+
+    def test_unknown_key_shows_help_and_reasks(self):
+        path = self.make_mp3()
+        self.install(FakeNetwork([itunes_result("Daft Punk", "Discovery")]))
+        ui = ScriptedUI(["x", ""])
+        result = aca.process_file(path, self.options(), fresh_caches(), ui)
+        self.assertEqual(result.status, "embedded")
+        self.assertIn(aca.HELP_TEXT, ui.messages)
+
+    def test_low_score_candidate_is_still_offered(self):
+        """自動モードでは弾かれる候補も、対話モードでは本人が判断できる."""
+        path = self.make_mp3()
+        self.install(FakeNetwork([itunes_result("無関係な人", "無関係な盤")]))
+        ui = ScriptedUI([""])
+        result = aca.process_file(path, self.options(), fresh_caches(), ui)
+        self.assertEqual(result.status, "embedded")
+
+    def test_same_album_is_asked_only_once(self):
+        first = self.make_mp3("01.mp3")
+        second = self.make_mp3("02.mp3")
+        self.install(FakeNetwork([itunes_result("Daft Punk", "Discovery")]))
+        caches = fresh_caches()
+        options = self.options()
+        ui = ScriptedUI([""])
+        self.assertEqual(aca.process_file(first, options, caches, ui).status, "embedded")
+        self.assertEqual(aca.process_file(second, options, caches, ui).status, "embedded")
+        self.assertEqual(len(ui.previews), 1, "同じアルバムで2回確認している")
+
+    def test_ask_every_file_asks_again(self):
+        first = self.make_mp3("01.mp3")
+        second = self.make_mp3("02.mp3")
+        self.install(FakeNetwork([itunes_result("Daft Punk", "Discovery")]))
+        caches = fresh_caches()
+        options = self.options(ask_every_file=True)
+        ui = ScriptedUI(["", ""])
+        aca.process_file(first, options, caches, ui)
+        aca.process_file(second, options, caches, ui)
+        self.assertEqual(len(ui.previews), 2)
+
+    def test_dry_run_previews_without_writing(self):
+        path = self.make_mp3()
+        self.install(FakeNetwork([itunes_result("Daft Punk", "Discovery")]))
+        ui = ScriptedUI([""])
+        result = aca.process_file(path, self.options(dry_run=True), fresh_caches(), ui)
+        self.assertEqual(result.status, "dry-run")
+        self.assertFalse(aca.has_cover(path))
+        self.assertEqual(len(ui.previews), 1)
+
+    def test_local_cover_is_offered_first(self):
+        path = self.make_mp3()
+        with open(os.path.join(self.dir, "cover.jpg"), "wb") as handle:
+            handle.write(synthetic.fake_jpeg())
+        self.install(FakeNetwork([itunes_result("Daft Punk", "Discovery")]))
+        ui = ScriptedUI([""])
+        result = aca.process_file(path, default_options(interactive=True), fresh_caches(), ui)
+        self.assertEqual(result.source, "local")
+        self.assertIn("フォルダ内の画像", ui.previews[0][1][2])
+
+
+class CandidateTest(unittest.TestCase):
+    def setUp(self):
+        self._orig = (aca.http_get, aca.http_get_json)
+
+        def restore():
+            aca.http_get, aca.http_get_json = self._orig
+
+        self.addCleanup(restore)
+
+    def test_candidates_sorted_and_deduped(self):
+        net = FakeNetwork([
+            itunes_result("別の人", "別の盤", "https://example.com/x/100x100bb.jpg"),
+            itunes_result("Daft Punk", "Discovery", "https://example.com/y/100x100bb.jpg"),
+            itunes_result("Daft Punk", "Discovery", "https://example.com/y/100x100bb.jpg"),
+        ])
+        aca.http_get_json = net.get_json
+        info = aca.TrackInfo(path="x.mp3", artist="Daft Punk", album="Discovery")
+        found = aca.itunes_candidates(info, 600, "JP", aca.RateLimiter(0))
+        self.assertEqual(len(found), 2)
+        self.assertGreater(found[0].score, found[1].score)
+        self.assertIn("Daft Punk", found[0].label)
+
+    def test_musicbrainz_candidates(self):
+        payload = {"releases": [
+            {"id": "aaaaaaaa-1111", "title": "Discovery",
+             "artist-credit": [{"name": "Daft Punk"}]},
+        ]}
+        aca.http_get_json = lambda url, timeout=20.0: payload
+        info = aca.TrackInfo(path="x.mp3", artist="Daft Punk", album="Discovery")
+        found = aca.musicbrainz_candidates(info, 600, aca.RateLimiter(0))
+        self.assertEqual(len(found), 1)
+        self.assertIn("aaaaaaaa-1111", found[0].url)
+        self.assertTrue(found[0].url.endswith("front-1200"))  # size 600 → 1200px を要求
+        small = aca.musicbrainz_candidates(
+            aca.TrackInfo(path="x.mp3", artist="Daft Punk", album="Discovery"),
+            300, aca.RateLimiter(0),
+        )
+        self.assertTrue(small[0].url.endswith("front-500"))
+
+    def test_fetch_cover_passes_through_local_data(self):
+        cover = aca.Cover(data=synthetic.fake_jpeg(), mime="image/jpeg", source="local")
+        self.assertIs(aca.fetch_cover(cover), cover)
+
+
+class PreviewModuleTest(unittest.TestCase):
+    def test_null_previewer_prints_text(self):
+        import preview as preview_module
+
+        previewer = preview_module.NullPreviewer()
+        self.assertEqual(previewer.name, "none")
+        previewer.close()  # 例外が出ないこと
+
+    def test_create_previewer_none_mode(self):
+        import preview as preview_module
+
+        previewer, note = preview_module.create_previewer("none")
+        self.assertEqual(previewer.name, "none")
+        self.assertEqual(note, "")
+
+    def test_render_ansi_shape(self):
+        import preview as preview_module
+
+        if not preview_module.pillow_available():
+            self.skipTest("Pillow 未インストール")
+        from PIL import Image
+
+        buffer = io.BytesIO()
+        Image.new("RGB", (120, 120), (10, 20, 30)).save(buffer, "JPEG")
+        art = preview_module.render_ansi(buffer.getvalue(), width=20)
+        rows = art.splitlines()
+        self.assertEqual(len(rows), 10)  # 1 行に 2 ピクセル分
+        self.assertTrue(all(row.count("▀") == 20 for row in rows))
+        self.assertEqual(preview_module.image_dimensions(buffer.getvalue()), (120, 120))
+
+    def test_image_dimensions_on_broken_data(self):
+        import preview as preview_module
+
+        self.assertIsNone(preview_module.image_dimensions(b"not an image"))
+
+
+class InteractiveCliTest(unittest.TestCase):
+    def test_interactive_requires_tty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            synthetic.write_mp3(os.path.join(tmp, "a.mp3"))
+            self.assertEqual(aca.main([tmp, "-i", "--offline"]), 2)
